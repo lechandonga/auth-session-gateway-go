@@ -23,6 +23,10 @@ import (
 )
 
 func buildApp(t *testing.T) (http.Handler, *auth.Service, *audit.MemorySink) {
+	return buildAppAt(t, nil, 5)
+}
+
+func buildAppAt(t *testing.T, clock func() time.Time, maxSessions int) (http.Handler, *auth.Service, *audit.MemorySink) {
 	t.Helper()
 	kr := keyring.NewMemoryKeyring()
 	_ = kr.AddKey(&keyring.Key{ID: "k1", Secret: []byte("http-secret-1"),
@@ -30,17 +34,25 @@ func buildApp(t *testing.T) (http.Handler, *auth.Service, *audit.MemorySink) {
 	users := auth.NewMemoryUsers()
 	alice, _ := auth.NewUser("u-alice", "alice", "alice-pass",
 		[]string{"viewer"}, []string{"docs:read"}, map[string]string{"dept": "sales"})
+	bob, _ := auth.NewUser("u-bob", "bob", "bob-pass",
+		[]string{"editor"}, []string{"docs:read", "docs:write"}, nil)
 	adm, _ := auth.NewUser("u-admin", "admin", "admin-pass",
 		[]string{"admin"}, []string{"*"}, nil)
 	users.Add(alice)
+	users.Add(bob)
 	users.Add(adm)
 	sink := audit.NewMemorySink()
+	if clock == nil {
+		clock = time.Now
+	}
 	svc := auth.NewService(auth.Config{
 		Users:    users,
-		Sessions: session.NewManager(session.NewMemoryStore(), time.Hour),
+		Sessions: session.NewManager(session.NewMemoryStore(), 10*time.Minute, time.Hour, maxSessions),
 		Signer:   token.NewHS256Signer(kr),
 		Limiter:  ratelimit.NewMemoryLimiter(ratelimit.DefaultPolicy()),
 		Audit:    sink, AccessTTL: 15 * time.Minute, RefreshTTL: time.Hour,
+		IdleTTL: 10 * time.Minute, AbsoluteTTL: time.Hour, MaxSessions: maxSessions,
+		Clock: clock,
 	})
 	engine := authz.NewEngine([]authz.Rule{
 		{Name: "deny-secrets", Effect: authz.EffectDeny, ResourcePattern: "/docs/secret/**"},
@@ -56,6 +68,8 @@ func buildApp(t *testing.T) (http.Handler, *auth.Service, *audit.MemorySink) {
 	mux.HandleFunc("/login", srv.login)
 	mux.HandleFunc("/refresh", srv.refresh)
 	mux.HandleFunc("/logout", srv.logout)
+	mux.HandleFunc("/sessions", srv.sessions)
+	mux.HandleFunc("/sessions/revoke", srv.revokeSession)
 	mux.HandleFunc("/rotate-keys", srv.rotateKeys)
 	mux.HandleFunc("/audit", srv.listAudit)
 	mux.HandleFunc("/", srv.resource)

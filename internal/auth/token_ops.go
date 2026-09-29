@@ -30,7 +30,14 @@ func (s *Service) Authenticate(ctx context.Context, accessToken string) (*User, 
 	if claims.TokenType != "access" {
 		return nil, nil, ErrInvalidToken
 	}
-	return s.authenticateClaims(ctx, claims)
+	u, view, err := s.authenticateClaims(ctx, claims)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Successful use counts as activity and pushes the idle window only via
+	// LastActiveAt tracking; the idle deadline itself moves on refresh.
+	_ = s.cfg.Sessions.Touch(ctx, view.ID, now)
+	return u, view, nil
 }
 
 // Logout cryptographically validates the token to name the session, then
@@ -64,14 +71,7 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (*LoginToken
 	now := s.cfg.Clock()
 	res, err := s.cfg.Sessions.Rotate(ctx, refreshToken, now)
 	if err != nil {
-		if errors.Is(err, session.ErrRefreshReused) {
-			s.emit(ctx, audit.Event{
-				EventID: newEventID("reuse"), Type: audit.EventRefreshReuse, OccurredAt: now,
-				Details: map[string]string{"token": "***REDACTED***"},
-			})
-			return nil, session.ErrRefreshReused
-		}
-		return nil, ErrInvalidToken
+		return nil, s.mapSessionError(ctx, err, now)
 	}
 	var u *User
 	if byID, ok := s.cfg.Users.(userByIDer); ok {
@@ -99,12 +99,109 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (*LoginToken
 		Principal: u.ID, SessionID: res.Session.ID, Details: map[string]string{"kid": kid},
 	})
 	return &LoginTokens{
-		AccessToken:  access,
-		RefreshToken: res.NewRefresh,
-		SessionID:    res.Session.ID,
-		KeyID:        kid,
-		ExpiresAt:    expires,
+		AccessToken:      access,
+		RefreshToken:     res.NewRefresh,
+		SessionID:        res.Session.ID,
+		KeyID:            kid,
+		ExpiresAt:        expires,
+		IdleDeadline:     res.Session.IdleDeadline,
+		AbsoluteDeadline: res.Session.AbsoluteDeadline,
 	}, nil
+}
+
+// mapSessionError translates session-layer failures into distinct auth
+// errors and emits the corresponding audit record. Reuse is reported with a
+// stable per-token-hash event ID so the same replayed token is never
+// double-counted; the family kill itself happens exactly once in the
+// session manager.
+func (s *Service) mapSessionError(ctx context.Context, err error, now time.Time) error {
+	switch {
+	case errors.Is(err, session.ErrRefreshReused):
+		s.emit(ctx, audit.Event{
+			EventID: newEventID("reuse"), Type: audit.EventRefreshReuse, OccurredAt: now,
+			Details: map[string]string{"token": "***REDACTED***"},
+		})
+		return session.ErrRefreshReused
+	case errors.Is(err, session.ErrSessionIdle):
+		return ErrSessionIdle
+	case errors.Is(err, session.ErrSessionExpired):
+		return ErrSessionAbsolute
+	case errors.Is(err, session.ErrSessionRevoked):
+		return ErrSessionRevoked
+	case errors.Is(err, session.ErrSessionNotFound), errors.Is(err, session.ErrRefreshUnknown):
+		return ErrInvalidToken
+	default:
+		return ErrInvalidToken
+	}
+}
+
+// SessionInfo is the non-sensitive per-session view returned to owners.
+type SessionInfo struct {
+	ID               string    `json:"session_id"`
+	Label            string    `json:"label"`
+	CreatedAt        time.Time `json:"created_at"`
+	LastActiveAt     time.Time `json:"last_active_at"`
+	IdleDeadline     time.Time `json:"idle_deadline"`
+	AbsoluteDeadline time.Time `json:"absolute_deadline"`
+	Current          bool      `json:"current,omitempty"`
+}
+
+// ListSessions returns the caller's active sessions.
+func (s *Service) ListSessions(ctx context.Context, userID, currentSessionID string, now time.Time) ([]SessionInfo, error) {
+	active, err := s.cfg.Sessions.ListActive(ctx, userID, now)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SessionInfo, 0, len(active))
+	for _, sess := range active {
+		out = append(out, SessionInfo{
+			ID: sess.ID, Label: sess.Label, CreatedAt: sess.CreatedAt,
+			LastActiveAt: sess.LastActiveAt, IdleDeadline: sess.IdleDeadline,
+			AbsoluteDeadline: sess.AbsoluteDeadline,
+			Current:          sess.ID == currentSessionID,
+		})
+	}
+	return out, nil
+}
+
+// RevokeSession revokes one of the caller's own sessions. Not-found,
+// ownership violation, already-revoked and expired are distinct outcomes;
+// every attempt is audited, and repeat reports cannot double-revoke.
+func (s *Service) RevokeSession(ctx context.Context, actorUserID, sessionID string, now time.Time) error {
+	err := s.cfg.Sessions.RevokeOne(ctx, actorUserID, sessionID, session.RevokeAdmin, now)
+	switch {
+	case err == nil:
+		s.emit(ctx, audit.Event{
+			EventID: "revokeone:" + sessionID, Type: audit.EventRevoke, OccurredAt: now,
+			Principal: actorUserID, SessionID: sessionID,
+			Details: map[string]string{"reason": string(session.RevokeAdmin)},
+		})
+		return nil
+	case errors.Is(err, session.ErrNotOwner):
+		s.emit(ctx, audit.Event{
+			EventID: newEventID("revdeny"), Type: audit.EventRevokeDenied, OccurredAt: now,
+			Principal: actorUserID, SessionID: sessionID,
+			Details: map[string]string{"reason": "not_owner"},
+		})
+		return ErrNotOwner
+	case errors.Is(err, session.ErrSessionNotFound):
+		// Do not attribute an attempt against a nonexistent session to a
+		// victim; record against the actor without touching any session.
+		s.emit(ctx, audit.Event{
+			EventID: newEventID("revdeny"), Type: audit.EventRevokeDenied, OccurredAt: now,
+			Principal: actorUserID, SessionID: sessionID,
+			Details: map[string]string{"reason": "not_found"},
+		})
+		return ErrSessionNotFound
+	case errors.Is(err, session.ErrSessionIdle):
+		return ErrSessionIdle
+	case errors.Is(err, session.ErrSessionExpired):
+		return ErrSessionAbsolute
+	case errors.Is(err, session.ErrSessionRevoked):
+		return ErrSessionRevoked
+	default:
+		return ErrInvalidToken
+	}
 }
 
 // authenticateClaims resolves a principal/session view from verified claims.
@@ -112,7 +209,12 @@ func (s *Service) authenticateClaims(ctx context.Context, claims *token.Claims) 
 	now := s.cfg.Clock()
 	sess, err := s.cfg.Sessions.Validate(ctx, claims.SessionID, now)
 	if err != nil {
-		return nil, nil, ErrInvalidToken
+		// A family killed by reuse presents to access-token callers as a
+		// revoked session; only refresh-token replays emit reuse events.
+		if errors.Is(err, session.ErrRefreshReused) {
+			return nil, nil, ErrSessionRevoked
+		}
+		return nil, nil, s.mapSessionError(ctx, err, now)
 	}
 	var u *User
 	if byID, ok := s.cfg.Users.(userByIDer); ok {

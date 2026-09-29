@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 )
@@ -92,9 +93,60 @@ func (s *MemoryStore) RevokeFamily(ctx context.Context, familyID string, reason 
 	return s.revokeFamilyLocked(familyID, reason, now)
 }
 
-func (s *MemoryStore) RevokeSession(ctx context.Context, id string, reason RevokeReason, now time.Time) error {
+func (s *MemoryStore) ListUserSessions(ctx context.Context, userID string) ([]*Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var out []*Session
+	for _, sess := range s.sessions {
+		if sess.UserID == userID {
+			out = append(out, cloneSession(sess))
+		}
+	}
+	return out, nil
+}
+
+// evictLRULocked revokes active sessions of userID, keeping at most keep,
+// choosing the longest-idle sessions first (LastActiveAt, ties broken by
+// creation time then ID for determinism). Caller holds s.mu.
+func (s *MemoryStore) evictLRULocked(userID string, keep int, reason RevokeReason, now time.Time) ([]*Session, error) {
+	if keep < 0 {
+		keep = 0
+	}
+	var active []*Session
+	for _, sess := range s.sessions {
+		if sess.UserID == userID && !sess.Revoked {
+			active = append(active, sess)
+		}
+	}
+	sort.Slice(active, func(i, j int) bool {
+		if !active[i].LastActiveAt.Equal(active[j].LastActiveAt) {
+			return active[i].LastActiveAt.Before(active[j].LastActiveAt)
+		}
+		if !active[i].CreatedAt.Equal(active[j].CreatedAt) {
+			return active[i].CreatedAt.Before(active[j].CreatedAt)
+		}
+		return active[i].ID < active[j].ID
+	})
+	var evicted []*Session
+	if len(active) > keep {
+		for _, sess := range active[:len(active)-keep] {
+			if err := s.revokeSessionLocked(sess.ID, reason, now); err == nil {
+				evicted = append(evicted, cloneSession(sess))
+			}
+		}
+	}
+	return evicted, nil
+}
+
+func (s *MemoryStore) EvictLRU(ctx context.Context, userID string, keep int, reason RevokeReason, now time.Time) ([]*Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.evictLRULocked(userID, keep, reason, now)
+}
+
+// revokeSessionLocked revokes a single session and its current refresh
+// records only; sibling sessions of the same user are untouched.
+func (s *MemoryStore) revokeSessionLocked(id string, reason RevokeReason, now time.Time) error {
 	sess, ok := s.sessions[id]
 	if !ok {
 		return ErrSessionNotFound
@@ -109,6 +161,12 @@ func (s *MemoryStore) RevokeSession(ctx context.Context, id string, reason Revok
 		}
 	}
 	return nil
+}
+
+func (s *MemoryStore) RevokeSession(ctx context.Context, id string, reason RevokeReason, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.revokeSessionLocked(id, reason, now)
 }
 
 func (s *MemoryStore) PutRefresh(ctx context.Context, r *RefreshRecord) error {

@@ -39,14 +39,17 @@ func newHarness(t *testing.T, policy ratelimit.Policy) *harness {
 	users.Add(u)
 	sink := audit.NewMemorySink()
 	svc := NewService(Config{
-		Users:      users,
-		Sessions:   session.NewManager(session.NewMemoryStore(), time.Hour),
-		Signer:     token.NewHS256Signer(kr),
-		Limiter:    ratelimit.NewMemoryLimiter(policy),
-		Audit:      sink,
-		AccessTTL:  time.Minute,
-		RefreshTTL: time.Hour,
-		Clock:      func() time.Time { return cur },
+		Users:       users,
+		Sessions:    session.NewManager(session.NewMemoryStore(), time.Hour, 24*time.Hour, 10),
+		Signer:      token.NewHS256Signer(kr),
+		Limiter:     ratelimit.NewMemoryLimiter(policy),
+		Audit:       sink,
+		AccessTTL:   time.Minute,
+		RefreshTTL:  time.Hour,
+		IdleTTL:     time.Hour,
+		AbsoluteTTL: 24 * time.Hour,
+		MaxSessions: 10,
+		Clock:       func() time.Time { return cur },
 	})
 	return &harness{svc: svc, kr: kr, sink: sink, now: cur}
 }
@@ -122,11 +125,11 @@ func TestFullLifecycleRotateRevokeAndKeyRotation(t *testing.T) {
 	if _, err := h.svc.Refresh(ctx, tok.RefreshToken); !errors.Is(err, session.ErrRefreshReused) {
 		t.Fatalf("replay err = %v, want ErrRefreshReused", err)
 	}
-	if _, _, err := h.svc.Authenticate(ctx, rot.AccessToken); !errors.Is(err, ErrInvalidToken) {
-		t.Fatalf("access after family revoke err = %v, want ErrInvalidToken", err)
+	if _, _, err := h.svc.Authenticate(ctx, rot.AccessToken); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("access after family revoke err = %v, want revoked session", err)
 	}
-	if _, err := h.svc.Refresh(ctx, rot.RefreshToken); !errors.Is(err, ErrInvalidToken) {
-		t.Fatalf("rotated refresh after reuse err = %v, want ErrInvalidToken", err)
+	if _, err := h.svc.Refresh(ctx, rot.RefreshToken); !errors.Is(err, ErrSessionRevoked) {
+		t.Fatalf("rotated refresh after reuse err = %v, want ErrSessionRevoked", err)
 	}
 	var reuse, denies int
 	events, _ := h.sink.List(ctx)
@@ -154,10 +157,10 @@ func TestLogoutRevokes(t *testing.T) {
 	if err := h.svc.Logout(ctx, tok.AccessToken); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := h.svc.Authenticate(ctx, tok.AccessToken); !errors.Is(err, ErrInvalidToken) {
+	if _, _, err := h.svc.Authenticate(ctx, tok.AccessToken); !errors.Is(err, ErrSessionRevoked) {
 		t.Fatalf("post-logout auth err = %v", err)
 	}
-	if _, err := h.svc.Refresh(ctx, tok.RefreshToken); !errors.Is(err, ErrInvalidToken) {
+	if _, err := h.svc.Refresh(ctx, tok.RefreshToken); !errors.Is(err, ErrSessionRevoked) {
 		t.Fatalf("post-logout refresh err = %v", err)
 	}
 	t.Log("input=logout basis=family revoke rule=session+all refresh tokens dead")

@@ -7,11 +7,12 @@ import (
 	"github.com/lechandonga/auth-session-gateway-go/internal/audit"
 	"github.com/lechandonga/auth-session-gateway-go/internal/csrf"
 	"github.com/lechandonga/auth-session-gateway-go/internal/ratelimit"
+	"github.com/lechandonga/auth-session-gateway-go/internal/session"
 	"github.com/lechandonga/auth-session-gateway-go/internal/token"
 )
 
 // Login verifies credentials, applies the lockout/throttle policy and
-// issues an access/refresh token pair bound to a new session family.
+// issues an access/refresh token pair bound to a new independent session.
 //
 // Lockout and throttle are reported via distinct errors (ErrLocked vs
 // ErrThrottled). Counter mutation and lock transition happen inside the
@@ -19,6 +20,14 @@ import (
 // threshold nor cross it twice. Each failure carries a unique event ID,
 // making retried requests idempotent rather than double-counted.
 func (s *Service) Login(ctx context.Context, username, password, peer string) (*LoginTokens, error) {
+	return s.LoginWithLabel(ctx, username, password, peer, "")
+}
+
+// LoginWithLabel is Login with a client-supplied device/source label. When
+// the per-account active-session cap is exceeded the longest-idle sessions
+// are evicted atomically with login: their credentials are dead the instant
+// the new session appears, and each eviction gets its own audit event.
+func (s *Service) LoginWithLabel(ctx context.Context, username, password, peer, label string) (*LoginTokens, error) {
 	now := s.cfg.Clock()
 	key := "login:" + username
 	eventID := newEventID("fail")
@@ -84,10 +93,17 @@ func (s *Service) Login(ctx context.Context, username, password, peer string) (*
 	// Success resets counters (idempotent).
 	_ = s.cfg.Limiter.RecordSuccess(ctx, key, "ok:"+eventID, now)
 
-	sess, rawRefresh, err := s.cfg.Sessions.Issue(ctx, u.ID, s.cfg.RefreshTTL, now)
+	issue, err := s.cfg.Sessions.Issue(ctx, session.IssueParams{
+		UserID:      u.ID,
+		Label:       label,
+		IdleTTL:     s.cfg.IdleTTL,
+		AbsoluteTTL: s.cfg.AbsoluteTTL,
+		Now:         now,
+	})
 	if err != nil {
 		return nil, err
 	}
+	sess, rawRefresh := issue.Session, issue.Refresh
 	expires := now.Add(s.cfg.AccessTTL)
 	access, kid, err := s.cfg.Signer.Issue(ctx, token.Claims{
 		Subject:    u.ID,
@@ -104,13 +120,27 @@ func (s *Service) Login(ctx context.Context, username, password, peer string) (*
 	}
 	s.emit(ctx, audit.Event{
 		EventID: "loginok:" + sess.ID, Type: audit.EventLoginSuccess, OccurredAt: now,
-		Principal: u.ID, SessionID: sess.ID, Details: map[string]string{"kid": kid, "peer": peer},
+		Principal: u.ID, SessionID: sess.ID,
+		Details: map[string]string{"kid": kid, "peer": csrf.Sanitize(peer),
+			"label": csrf.Sanitize(label)},
 	})
+	for _, ev := range issue.Evicted {
+		s.emit(ctx, audit.Event{
+			EventID: "evict:" + ev.ID, Type: audit.EventSessionEvicted, OccurredAt: now,
+			Principal: u.ID, SessionID: ev.ID,
+			Details: map[string]string{
+				"reason":         string(session.RevokeEvicted),
+				"last_active_at": ev.LastActiveAt.Format(time.RFC3339),
+			},
+		})
+	}
 	return &LoginTokens{
-		AccessToken:  access,
-		RefreshToken: rawRefresh,
-		SessionID:    sess.ID,
-		KeyID:        kid,
-		ExpiresAt:    expires,
+		AccessToken:      access,
+		RefreshToken:     rawRefresh,
+		SessionID:        sess.ID,
+		KeyID:            kid,
+		ExpiresAt:        expires,
+		IdleDeadline:     sess.IdleDeadline,
+		AbsoluteDeadline: sess.AbsoluteDeadline,
 	}, nil
 }

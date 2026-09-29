@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"os"
@@ -62,11 +63,12 @@ func main() {
 		Window:        10 * time.Minute,
 	})
 	store := session.NewMemoryStore()
-	mgr := session.NewManager(store, 24*time.Hour)
+	mgr := session.NewManager(store, 30*time.Minute, 24*time.Hour, 5)
 
 	svc := auth.NewService(auth.Config{
 		Users: users, Sessions: mgr, Signer: signer, Limiter: limiter,
-		Audit: sink, AccessTTL: 15 * time.Minute, RefreshTTL: 24 * time.Hour, Clock: now,
+		Audit: sink, AccessTTL: 15 * time.Minute, RefreshTTL: 24 * time.Hour,
+		IdleTTL: 30 * time.Minute, AbsoluteTTL: 24 * time.Hour, MaxSessions: 5, Clock: now,
 	})
 
 	// --- Authorization policy. Explicit deny beats any allow regardless
@@ -91,6 +93,8 @@ func main() {
 	mux.HandleFunc("/login", srv.login)
 	mux.HandleFunc("/refresh", srv.refresh)
 	mux.HandleFunc("/logout", srv.logout)
+	mux.HandleFunc("/sessions", srv.sessions)
+	mux.HandleFunc("/sessions/revoke", srv.revokeSession)
 	mux.HandleFunc("/rotate-keys", srv.rotateKeys)
 	mux.HandleFunc("/audit", srv.listAudit)
 	mux.HandleFunc("/", srv.resource)
@@ -142,6 +146,20 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 type loginReq struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
+	Label    string `json:"label"`
+}
+
+const refreshCookieName = "refresh_token"
+
+func (s *server) setSessionCookies(w http.ResponseWriter, tok *auth.LoginTokens, csrfTok string) {
+	http.SetCookie(w, &http.Cookie{Name: "access_token", Value: tok.AccessToken,
+		Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{Name: refreshCookieName, Value: tok.RefreshToken,
+		Path: "/refresh", HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	if csrfTok != "" {
+		http.SetCookie(w, &http.Cookie{Name: s.csrf.CookieName(), Value: csrfTok,
+			Path: "/", HttpOnly: false, SameSite: http.SameSiteStrictMode})
+	}
 }
 
 func (s *server) login(w http.ResponseWriter, r *http.Request) {
@@ -154,9 +172,10 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed json"})
 		return
 	}
-	tok, err := s.svc.Login(r.Context(), req.Username, req.Password, r.RemoteAddr)
+	tok, err := s.svc.LoginWithLabel(r.Context(), req.Username, req.Password,
+		r.RemoteAddr, req.Label)
 	if err != nil {
-		s.log.Printf("login input={user:%s peer:%s} decision=deny basis=%q password=%s",
+		s.log.Printf("login input={user:%q peer:%q} decision=deny basis=%q password=%s",
 			csrf.Sanitize(req.Username), r.RemoteAddr, err.Error(), csrf.Mask("password", req.Password))
 		status := http.StatusUnauthorized
 		switch {
@@ -170,18 +189,17 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	// Issue the double-submit CSRF cookie alongside the session cookie.
 	csrfTok, _ := s.csrf.GenerateToken()
-	http.SetCookie(w, &http.Cookie{Name: "access_token", Value: tok.AccessToken,
-		Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
-	http.SetCookie(w, &http.Cookie{Name: s.csrf.CookieName(), Value: csrfTok,
-		Path: "/", HttpOnly: false, SameSite: http.SameSiteStrictMode})
-	s.log.Printf("login input={user:%s} decision=allow basis=credentials+policy session=%s key=%s",
-		csrf.Sanitize(req.Username), tok.SessionID, tok.KeyID)
+	s.setSessionCookies(w, tok, csrfTok)
+	s.log.Printf("login input={user:%q label:%q} decision=allow basis=credentials+policy session=%s key=%s refresh=%s",
+		csrf.Sanitize(req.Username), csrf.Sanitize(req.Label), tok.SessionID, tok.KeyID,
+		csrf.Mask("token", tok.RefreshToken))
 	writeJSON(w, http.StatusOK, map[string]any{
-		"session_id":    tok.SessionID,
-		"key_id":        tok.KeyID,
-		"expires_at":    tok.ExpiresAt,
-		"refresh_token": csrf.Mask("token", tok.RefreshToken),
-		"csrf_token":    csrfTok,
+		"session_id":        tok.SessionID,
+		"key_id":            tok.KeyID,
+		"expires_at":        tok.ExpiresAt,
+		"idle_deadline":     tok.IdleDeadline,
+		"absolute_deadline": tok.AbsoluteDeadline,
+		"csrf_token":        csrfTok,
 	})
 }
 
@@ -196,21 +214,90 @@ func (s *server) extractToken(r *http.Request) string {
 }
 
 func (s *server) refresh(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		RefreshToken string `json:"refresh_token"`
-	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
-	tok, err := s.svc.Refresh(r.Context(), req.RefreshToken)
-	if err != nil {
-		s.log.Printf("refresh input={token:%s} decision=deny basis=%q", csrf.Mask("token", req.RefreshToken), err.Error())
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
-	s.log.Printf("refresh decision=allow basis=rotation session=%s key=%s", tok.SessionID, tok.KeyID)
-	writeJSON(w, http.StatusOK, map[string]string{"key_id": tok.KeyID, "session_id": tok.SessionID})
+	// State-changing entry: CSRF double-submit is enforced before the
+	// refresh credential is inspected, so a CSRF rejection can never be
+	// classified as credential reuse and can never touch a live session.
+	if status, errResp := s.requireCSRF(r); status != 0 {
+		s.log.Printf("refresh input={cookie:%s} decision=deny basis=%q rule=csrf_precheck",
+			csrf.Mask("token", r.Header.Get("X-CSRF-Token")), errResp["error"])
+		writeJSON(w, status, errResp)
+		return
+	}
+	c, err := r.Cookie(refreshCookieName)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing refresh credential"})
+		return
+	}
+	tok, err := s.svc.Refresh(r.Context(), c.Value)
+	if err != nil {
+		s.log.Printf("refresh input={refresh:%s} decision=deny basis=%q",
+			csrf.Mask("token", c.Value), err.Error())
+		writeJSON(w, refreshErrorStatus(err), map[string]string{"error": err.Error()})
+		return
+	}
+	// Rotation delivers a brand-new pair; both cookies are overwritten
+	// atomically in this single response. The real credential values go
+	// ONLY to the client cookies — never into the body or logs.
+	s.setSessionCookies(w, tok, "")
+	s.log.Printf("refresh decision=allow basis=rotation session=%s key=%s new_access=%s new_refresh=%s",
+		tok.SessionID, tok.KeyID, csrf.Mask("token", tok.AccessToken), csrf.Mask("token", tok.RefreshToken))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"session_id":        tok.SessionID,
+		"key_id":            tok.KeyID,
+		"expires_at":        tok.ExpiresAt,
+		"idle_deadline":     tok.IdleDeadline,
+		"absolute_deadline": tok.AbsoluteDeadline,
+	})
+}
+
+func refreshErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, session.ErrRefreshReused):
+		return http.StatusConflict
+	case errors.Is(err, auth.ErrSessionIdle):
+		return http.StatusGone
+	case errors.Is(err, auth.ErrSessionAbsolute):
+		return http.StatusGone
+	case errors.Is(err, auth.ErrSessionRevoked):
+		return http.StatusUnauthorized
+	default:
+		return http.StatusUnauthorized
+	}
+}
+
+// requireCSRF enforces the double-submit check on state-changing routes.
+// Missing token (403 csrf: missing) and mismatched token (403 csrf:
+// mismatch) stay distinguishable; it never consults session state.
+func (s *server) requireCSRF(r *http.Request) (int, map[string]string) {
+	csrfCookie, _ := r.Cookie(s.csrf.CookieName())
+	cookieVal := ""
+	if csrfCookie != nil {
+		cookieVal = csrfCookie.Value
+	}
+	headerVal := r.Header.Get(s.csrf.HeaderName())
+	if cookieVal == "" || headerVal == "" {
+		return http.StatusForbidden, map[string]string{"error": csrf.ErrUnsafeMethod.Error()}
+	}
+	if err := s.csrf.Verify(cookieVal, headerVal); err != nil {
+		return http.StatusForbidden, map[string]string{"error": err.Error()}
+	}
+	return 0, nil
 }
 
 func (s *server) logout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if status, errResp := s.requireCSRF(r); status != 0 {
+		s.log.Printf("logout decision=deny basis=%q rule=csrf_precheck session_untouched", errResp["error"])
+		writeJSON(w, status, errResp)
+		return
+	}
 	tok := s.extractToken(r)
 	if tok == "" {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing token"})
@@ -221,7 +308,82 @@ func (s *server) logout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: "access_token", Value: "", MaxAge: -1, Path: "/"})
+	http.SetCookie(w, &http.Cookie{Name: refreshCookieName, Value: "", MaxAge: -1, Path: "/refresh"})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
+}
+
+// sessions handles GET (list own active sessions) and POST
+// /sessions/revoke (revoke one of the caller's own sessions).
+func (s *server) sessions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	u, view, err := s.authenticateCookie(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		return
+	}
+	infos, err := s.svc.ListSessions(r.Context(), u.ID, view.ID, s.svc.ClockNow())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sessions": infos})
+}
+
+func (s *server) revokeSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	// CSRF gate first: a forged cross-site request must never reach the
+	// ownership check nor mutate any session.
+	if status, errResp := s.requireCSRF(r); status != 0 {
+		s.log.Printf("sessions/revoke decision=deny basis=%q rule=csrf_precheck sessions_untouched", errResp["error"])
+		writeJSON(w, status, errResp)
+		return
+	}
+	u, _, err := s.authenticateCookie(r)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		return
+	}
+	var req struct {
+		SessionID string `json:"session_id"`
+	}
+	if dErr := json.NewDecoder(r.Body).Decode(&req); dErr != nil || req.SessionID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session_id required"})
+		return
+	}
+	if err := s.svc.RevokeSession(r.Context(), u.ID, req.SessionID, s.svc.ClockNow()); err != nil {
+		s.log.Printf("sessions/revoke input={actor:%s target:%s} decision=deny basis=%q",
+			u.ID, csrf.Sanitize(req.SessionID), err.Error())
+		status := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, auth.ErrNotOwner):
+			status = http.StatusForbidden
+		case errors.Is(err, auth.ErrSessionNotFound):
+			status = http.StatusNotFound
+		case errors.Is(err, auth.ErrSessionIdle), errors.Is(err, auth.ErrSessionAbsolute):
+			status = http.StatusGone
+		case errors.Is(err, auth.ErrSessionRevoked):
+			status = http.StatusConflict
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	s.log.Printf("sessions/revoke input={actor:%s target:%s} decision=allow basis=owner+active rule=single session revoked",
+		u.ID, csrf.Sanitize(req.SessionID))
+	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked", "session_id": req.SessionID})
+}
+
+func (s *server) authenticateCookie(r *http.Request) (*auth.User, *auth.SessionView, error) {
+	tok := s.extractToken(r)
+	if tok == "" {
+		return nil, nil, errors.New("missing token")
+	}
+	return s.svc.Authenticate(r.Context(), tok)
 }
 
 func (s *server) rotateKeys(w http.ResponseWriter, r *http.Request) {
