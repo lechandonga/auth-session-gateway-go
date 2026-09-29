@@ -3,6 +3,7 @@ package token
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -59,6 +60,13 @@ func (s *HS256Signer) Issue(ctx context.Context, c Claims, now time.Time) (strin
 	}
 	if c.IssuedAt == 0 {
 		c.IssuedAt = now.Unix()
+	}
+	if c.JTI == "" {
+		b := make([]byte, 16)
+		if _, err := rand.Read(b); err != nil {
+			return "", "", err
+		}
+		c.JTI = b64.EncodeToString(b)
 	}
 	tok, err := s.sign(kid, secret, c)
 	if err != nil {

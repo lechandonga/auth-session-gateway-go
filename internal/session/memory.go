@@ -63,6 +63,30 @@ func (s *MemoryStore) GetSessionByFamily(ctx context.Context, familyID string) (
 	return cloneSession(s.sessions[id]), nil
 }
 
+// ListSessionsByUser returns all of a user's sessions (any state).
+func (s *MemoryStore) ListSessionsByUser(ctx context.Context, userID string) ([]*Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*Session
+	for _, sess := range s.sessions {
+		if sess.UserID == userID {
+			out = append(out, cloneSession(sess))
+		}
+	}
+	return out, nil
+}
+
+// AllSessions returns every stored session.
+func (s *MemoryStore) AllSessions(ctx context.Context) ([]*Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]*Session, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		out = append(out, cloneSession(sess))
+	}
+	return out, nil
+}
+
 // RevokeFamilyLocked revokes the session belonging to familyID; the caller
 // must hold s.mu when composing a compound operation.
 func (s *MemoryStore) revokeFamilyLocked(familyID string, reason RevokeReason, now time.Time) error {

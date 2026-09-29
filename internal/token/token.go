@@ -29,6 +29,7 @@ type Claims struct {
 	IssuedAt   int64             `json:"iat"`
 	ExpiresAt  int64             `json:"exp"`
 	TokenType  string            `json:"typ"`
+	JTI        string            `json:"jti,omitempty"`
 }
 
 // IsExpired reports whether claims expire before now.

@@ -34,9 +34,14 @@ ADDR=127.0.0.1:18080 go run ./cmd/gateway
 
 HTTP 端点：
 
-- `POST /login` — 凭据校验，成功后下发 `access_token`（HttpOnly Cookie）与 `csrf_token`
-- `POST /refresh` — 刷新令牌轮换（body: `{"refresh_token":"..."}`）
-- `POST /logout` — 撤销会话族
+- `POST /login` — 凭据校验，成功后下发 `access_token`、`refresh_token`（均为 HttpOnly
+  Cookie）与 `csrf_token`；响应体只含 `session_id` / `key_id` / 过期时间等非敏感信息
+- `POST /refresh` — 续期：携带 `refresh_token` Cookie + 双提交 CSRF，成功后访问凭据与
+  刷新凭据同时轮换并重新下发 Cookie；老刷新凭据立即作废
+- `POST /logout` — 撤销当前会话族（需要 CSRF），幂等
+- `GET  /sessions` — 列出本账号当前活跃会话（建立时间、最近活动、对端、UA、是否当前设备）
+- `POST /sessions/{id}` — 定向撤销自己的一台设备（需要 CSRF）；越权 / 不存在 /
+  早已失效分别返回 `403 session_forbidden` / `404 session_not_found` / `410 already_inactive`
 - `POST /rotate-keys` — 轮换签名密钥（旧密钥保留用于历史校验）
 - `GET  /audit` — 查看审计事件
 - `/**` — 受保护资源，先认证后授权；Cookie 会话的非安全方法需带 `X-CSRF-Token`
@@ -44,9 +49,16 @@ HTTP 端点：
 快速体验：
 
 ```bash
-curl -c cj -X POST localhost:8080/login -d '{"username":"alice","password":"alice-pass"}'
-curl -b cj "localhost:8080/docs/r1?echo=<script>x</script>"   # 200，注入被转义
-curl -b cj -X POST localhost:8080/docs/r1                     # 403 CSRF 缺失
+curl -c cj -X POST localhost:8080/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"alice","password":"alice-pass"}'
+# access_token / refresh_token 都在 HttpOnly Cookie 里；csrf_token 在 body 与非 HttpOnly Cookie
+CSRF=$(awk '$6=="csrf_token"{print $7}' cj)
+curl -b cj -c cj -X POST localhost:8080/refresh -H "X-CSRF-Token: $CSRF"  # 双 Cookie 同步轮换
+curl -b cj "localhost:8080/docs/r1?echo=<script>x</script>"                # 新访问凭据 200，注入被转义
+curl -b cj localhost:8080/sessions                                        # 多端会话清单
+curl -b cj -X POST localhost:8080/sessions/<id> -H "X-CSRF-Token: $CSRF"  # 踢掉一台设备
+curl -b cj -X POST localhost:8080/docs/r1                                  # 403 CSRF 缺失
 for i in 1 2 3 4 5; do curl -s -o /dev/null -w "%{http_code} " \
   -X POST localhost:8080/login -d '{"username":"bob","password":"x"}'; done
 # 401 401 429 429 423 —— 凭据错误 / 限速 / 锁定 三种原因可区分
@@ -67,15 +79,72 @@ for i in 1 2 3 4 5; do curl -s -o /dev/null -w "%{http_code} " \
 
 ## 刷新令牌轮换与复用检测
 
+- **凭据交付方式**：访问凭据与刷新凭据都只通过 **HttpOnly + SameSite=Strict**
+  Cookie 下发（`access_token` 的 Path=`/`，`refresh_token` 的 Path 限定为 `/refresh`，
+  缩小暴露面）。响应体里**永远不出现**任何凭据值，只有 `session_id`、`key_id`、
+  `expires_at`、`idle_expires_at`、`absolute_expires_at`、`csrf_token` 这类非敏感信息。
+  续期成功后两个 Cookie **同步轮换**，客户端随后即可用新访问凭据访问受保护资源。
+- **状态变更入口的跨站校验**：`/refresh`、`/logout`、`/sessions/{id}` 以及 Cookie
+  会话的非安全方法都要求 `csrf_token` Cookie 与 `X-CSRF-Token` 头双提交一致。
+  缺令牌（`unsafe method without token`）与令牌不匹配（`token mismatch`）是两种可区分
+  结果；**CSRF 拦截发生在触碰任何会话状态之前**——被拦下的请求不会被算作刷新凭据复用，
+  也不会撤销仍然健康的会话，随后带正确令牌的续期照常成功。
 - 每个会话拥有一个 **family（会话族）**，刷新令牌链挂在该族上。
 - 刷新 = 单一临界区内“旧令牌置为 rotated + 新令牌落库”，不存在半更新状态。
 - 并发使用同一刷新令牌时：恰好 1 个成功，其余立即被识别（测试覆盖 20 并发 → 1 成功 /
   19 复用拒绝）。
 - **复用即失窃信号**：已轮换令牌被再次提交时返回 `ErrRefreshReused`，并连带撤销
   整个会话族——攻击者与原持有人的后续令牌同时失效，绝不静默放行。
+- 同一条链上的重复上报是幂等的：族级失效与 `refresh_reuse` 审计事件按 family ID
+  去重，只发生一次，不会因为多个落败请求而重复计数；之后同一族的凭据返回
+  `session_revoked`，与首次复用（`refresh_reuse`）仍然可区分。
 - 正常轮换（`Rotated`）与撤销作废（`Invalidated`）分开标记，因此“族已撤销”与
   “令牌复用”两种失败原因始终可区分。
-- 登出/管理员撤销走族级撤销，会话与全部未用刷新令牌立即死亡。
+- 对外拒绝原因分得开（HTTP 401，body 中 `code` 字段）：`refresh_reuse` /
+  `session_revoked` / `session_idle_expired` / `session_absolute_expired` /
+  `missing_refresh` / `invalid_token`，不会糊成一个笼统的“无效”。
+- 登出/定向撤销走族级撤销，会话与全部未用刷新令牌立即死亡。
+
+## 多端会话管理
+
+- **每次登录 = 一个独立会话（一台设备）**，各自有独立 ID 与刷新令牌族；会话记录
+  `created_at`、`last_active_at`、`idle_expires_at`、`absolute_expires_at`、来源
+  标记 `peer`（对端地址）与 `user_agent`，并有 `current` 标记发起查询的本端。
+- `GET /sessions` 只返回**本账号**的活跃会话（按最近活动倒序）；访问受保护资源与
+  续期都会在单锁内原子地更新 `last_active_at` 并滑动空闲窗口。
+- `POST /sessions/{id}` 只撤销该会话自己的族，其它设备、其它账号完全不受影响。
+  三种失败严格区分并独立成审计类型：
+  - 会话不属于调用者 → `403 session_forbidden`，审计 `session_revoke_denied`，
+    目标会话状态原封不动；
+  - 会话不存在 → `404 session_not_found`；
+  - 会话存在但早已失效（撤销/过期/已被淘汰）→ `410 already_inactive`，属于幂等
+    无操作，不会重复失效、不会重复计数。
+  - 成功撤销 → `200 {"revoked":true}`，审计 `session_revoked`（按会话 ID 幂等）。
+
+## 会话生命周期与容量约束
+
+- **空闲窗口（idle TTL）**：一段时间没有活动即失效；访问受保护资源（`Touch`）和
+  续期都会把空闲截止时间向后推。
+- **绝对上限（absolute TTL）**：从建立时刻起算的硬寿命，任何续期/活动都**不能**
+  把它向后推；空闲窗口即使滑动，截止时间也被钳制在绝对上限之内。
+- 空闲过期与绝对过期是两类不同的内部错误、撤销原因（`idle_expired` /
+  `absolute_expired`）与对外 `code`，与显式撤销（`revoked` / `targeted` / `logout` /
+  `capacity_eviction`）完全分开。
+- **容量上限**：单账号活跃会话数有上限（网关默认 5）。登录时若已达上限，按
+  **最久没有活动优先（LRU by `last_active_at`，建连时间、会话 ID 兜底决序）** 的
+  确定性规则淘汰最旧会话；被淘汰会话的全部凭据立即失效，并写一条 `session_evicted`
+  审计（带 `reason=capacity_eviction`）。淘汰在“插入新会话”之前的同一临界区完成，
+  不存在新会话已建立但超限状态可见的中间窗口。
+
+## 并发一致性（会话侧）
+
+- 会话存储只有一把锁。轮换的“旧令牌置 rotated + 新令牌落库 + 空闲窗口滑动”、
+  撤销的“会话标记 + 当前刷新凭据作废”、活动的“存活校验 + `last_active_at` 推进”、
+  容量淘汰的“淘汰旧会话 + 插入新会话”都是该锁内的原子复合操作。
+- 撤销与续期相撞时只会出现两种结局之一：续期先赢则随后的撤销杀死包含新凭据在内
+  的整条链；撤销先赢则续期返回 `session_revoked`。**绝不会出现“会话已撤销却换出了
+  可用新令牌”或“续期回报成功但老令牌仍可继续使用”**（`TestHTTPRevokeRacesRefresh`
+  以 30 轮随机交错验证该不变量，`go test -race` 下通过）。
 
 ## 密钥策略
 
@@ -112,7 +181,12 @@ for i in 1 2 3 4 5; do curl -s -o /dev/null -w "%{http_code} " \
 
 - Cookie 会话的非安全方法（POST/PUT/DELETE…）要求 `csrf_token` Cookie 与
   `X-CSRF-Token` 头双提交一致，常量时间比较；“缺失”（`unsafe method without token`）
-  与“不匹配”（`token mismatch`）分别报错。GET/HEAD/OPTIONS 豁免。
+  与“不匹配”（`token mismatch`）分别报错。GET/HEAD/OPTIONS 豁免。该规则覆盖所有会
+  改变会话状态的入口：`/refresh`、`/logout`、`/sessions/{id}` 及受保护资源写操作；
+  校验在任何会话状态变更之前执行，因此 CSRF 失败既不算凭据复用也不会误撤销会话。
+- 脱敏只作用于日志、审计这类**输出**：`refresh_token`/`access_token`/`password` 等在
+  日志与审计 details 中一律是 `***REDACTED***`，但服务端真正下发给客户端的 Cookie
+  仍是完整可用的凭据值；回显输入继续做 HTML 转义。
 - 统一安全响应头：CSP、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、
   `Referrer-Policy`、HSTS。
 - 所有回显输入经 HTML 转义（`<script>` 不会原样返回）；审计与日志中的
@@ -121,7 +195,12 @@ for i in 1 2 3 4 5; do curl -s -o /dev/null -w "%{http_code} " \
 ## 审计
 
 - 关键事件（`lockout` / `refresh_reuse` / `revoke` / `access_denied`）显式打类型标记，
+- 关键事件（`lockout` / `refresh_reuse` / `revoke` / `access_denied` /
+  `session_revoked` / `session_revoke_denied` / `session_evicted`）显式打类型标记，
   且可通过 `CriticalEvents` 单独提取，不允许静默丢弃。
+- 续期复用事件以 `reuse-family:<familyID>` 为幂等键：同一登录链上的多次复用重放只
+  产生一条审计；定向撤销以 `trevoke:<sessionID>`、容量淘汰以 `evict:<sessionID>` 为
+  键，重复上报不会重复失效或重复计数。
 - 事件以 `EventID` 幂等落库：重放/重复上报返回 `duplicate=true` 且不再生效，
   因此不会造成重复扣减或重复锁定；同一锁定周期只产生一条 lockout 事件（以
   `LockedUntil` 去重）。
@@ -155,6 +234,16 @@ go test -v ./...                  # 查看每个用例打印的输入 / 判定�
   作用域收窄、ABAC 条件、拒绝原因矩阵。
 - **端到端**：`cmd/gateway` —— 真实 HTTP 链路下的登录、CSRF、越权、轮换与
   401/403/423/429 状态码。
+- **续期链路（真实 HTTP 层）**：`cmd/gateway/session_flow_test.go` —
+  登录拿 HttpOnly 双 Cookie → 带刷新 Cookie + CSRF 续期 → 新访问凭据立即访问受保护
+  资源 → 老刷新凭据 `refresh_reuse` 被拒 → 族内新凭据连带失效；刷新凭据只在 Cookie、
+  绝不出现在响应体；缺/错 CSRF 不误伤会话。
+- **时间边界（时钟可控）**：`cmd/gateway/session_lifecycle_test.go`、
+  `internal/session/session_test.go` —— 空闲窗口边界（滑动后过期）、绝对上限边界
+  （持续活动仍在硬上限死亡）、`Touch` 只推空闲不推绝对。
+- **并发**：同刷新凭据并发续期单赢家、撤销与续期 30 轮竞态无中间态（HTTP 层）。
+- **多端与容量**：`cmd/gateway/session_devices_test.go` —— 会话清单字段、定向撤销
+  隔离性、越权/不存在/已失效三分、重复撤销幂等、上限 LRU 淘汰凭据即死且审计一次。
 
 > 说明：本组件为本地演示实现，内存数据重启即失；口令哈希使用加盐 SHA-256 而非
 > 内存硬化 KDF。接入生产时只需替换 `CredentialStore` / `Store` / `Sink` 三个边界

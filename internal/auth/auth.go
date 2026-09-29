@@ -25,6 +25,8 @@ var (
 	ErrThrottled = errors.New("auth: throttled")
 	// ErrInvalidToken indicates an access/refresh token is unusable.
 	ErrInvalidToken = errors.New("auth: invalid token")
+	// ErrSessionDenied is returned for targeted revocation access violations.
+	ErrSessionDenied = errors.New("auth: session access denied")
 )
 
 // User is a stored principal.
@@ -49,11 +51,13 @@ type verifier interface {
 
 // LoginTokens carries issued credentials.
 type LoginTokens struct {
-	AccessToken  string
-	RefreshToken string
-	SessionID    string
-	KeyID        string
-	ExpiresAt    time.Time
+	AccessToken       string
+	RefreshToken      string
+	SessionID         string
+	KeyID             string
+	ExpiresAt         time.Time
+	IdleExpiresAt     time.Time
+	AbsoluteExpiresAt time.Time
 }
 
 // Clock allows tests to control time.
@@ -61,12 +65,14 @@ type Clock func() time.Time
 
 // Config holds service dependencies and tunables.
 type Config struct {
-	Users      CredentialStore
-	Sessions   session.Manager
-	Signer     token.Signer
-	Limiter    ratelimit.Limiter
-	Audit      audit.Sink
-	AccessTTL  time.Duration
+	Users     CredentialStore
+	Sessions  session.Manager
+	Signer    token.Signer
+	Limiter   ratelimit.Limiter
+	Audit     audit.Sink
+	AccessTTL time.Duration
+	// RefreshTTL is retained for backwards compatibility; refresh/session
+	// lifetimes are owned by the session Manager (idle + absolute).
 	RefreshTTL time.Duration
 	Clock      Clock
 }

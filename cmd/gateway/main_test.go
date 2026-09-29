@@ -22,25 +22,48 @@ import (
 	"github.com/lechandonga/auth-session-gateway-go/internal/token"
 )
 
-func buildApp(t *testing.T) (http.Handler, *auth.Service, *audit.MemorySink) {
+type testApp struct {
+	h     http.Handler
+	svc   *auth.Service
+	sink  *audit.MemorySink
+	store *session.MemoryStore
+	now   func() time.Time
+	set   func(time.Time)
+}
+
+func buildApp(t *testing.T) *testApp {
+	return buildAppOpts(t, session.Options{
+		IdleTTL: 30 * time.Minute, AbsoluteTTL: 24 * time.Hour, MaxPerUser: 5,
+	})
+}
+
+func buildAppOpts(t *testing.T, sopts session.Options) *testApp {
 	t.Helper()
+	base := time.Date(2026, 9, 22, 10, 0, 0, 0, time.UTC)
+	cur := base
+	clock := func() time.Time { return cur }
 	kr := keyring.NewMemoryKeyring()
 	_ = kr.AddKey(&keyring.Key{ID: "k1", Secret: []byte("http-secret-1"),
-		Status: keyring.StatusActive, CreatedAt: time.Now()})
+		Status: keyring.StatusActive, CreatedAt: base})
 	users := auth.NewMemoryUsers()
 	alice, _ := auth.NewUser("u-alice", "alice", "alice-pass",
 		[]string{"viewer"}, []string{"docs:read"}, map[string]string{"dept": "sales"})
 	adm, _ := auth.NewUser("u-admin", "admin", "admin-pass",
 		[]string{"admin"}, []string{"*"}, nil)
+	bob, _ := auth.NewUser("u-bob", "bob", "bob-pass",
+		[]string{"viewer"}, []string{"docs:read"}, nil)
 	users.Add(alice)
 	users.Add(adm)
+	users.Add(bob)
 	sink := audit.NewMemorySink()
+	store := session.NewMemoryStore()
 	svc := auth.NewService(auth.Config{
 		Users:    users,
-		Sessions: session.NewManager(session.NewMemoryStore(), time.Hour),
+		Sessions: session.NewManager(store, sopts),
 		Signer:   token.NewHS256Signer(kr),
 		Limiter:  ratelimit.NewMemoryLimiter(ratelimit.DefaultPolicy()),
-		Audit:    sink, AccessTTL: 15 * time.Minute, RefreshTTL: time.Hour,
+		Audit:    sink, AccessTTL: 15 * time.Minute, RefreshTTL: 24 * time.Hour,
+		Clock: clock,
 	})
 	engine := authz.NewEngine([]authz.Rule{
 		{Name: "deny-secrets", Effect: authz.EffectDeny, ResourcePattern: "/docs/secret/**"},
@@ -51,15 +74,18 @@ func buildApp(t *testing.T) (http.Handler, *auth.Service, *audit.MemorySink) {
 	})
 	prot := csrf.NewProtector()
 	srv := &server{svc: svc, engine: engine, audit: sink, csrf: prot, keys: kr,
-		log: log.New(io.Discard, "", 0)}
+		log: log.New(io.Discard, "", 0), now: clock}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/login", srv.login)
 	mux.HandleFunc("/refresh", srv.refresh)
 	mux.HandleFunc("/logout", srv.logout)
+	mux.HandleFunc("/sessions/", srv.revokeSession)
+	mux.HandleFunc("/sessions", srv.listSessions)
 	mux.HandleFunc("/rotate-keys", srv.rotateKeys)
 	mux.HandleFunc("/audit", srv.listAudit)
 	mux.HandleFunc("/", srv.resource)
-	return srv.headers(mux), svc, sink
+	return &testApp{h: srv.headers(mux), svc: svc, sink: sink, store: store,
+		now: clock, set: func(tm time.Time) { cur = tm }}
 }
 
 func doJSON(t *testing.T, h http.Handler, req *http.Request) (int, map[string]any, []*http.Cookie) {
@@ -72,7 +98,8 @@ func doJSON(t *testing.T, h http.Handler, req *http.Request) (int, map[string]an
 }
 
 func TestHTTPEndToEnd(t *testing.T) {
-	h, _, sink := buildApp(t)
+	app := buildApp(t)
+	h, sink := app.h, app.sink
 	jar, _ := cookiejar.New(nil)
 	_ = jar
 	body := `{"username":"alice","password":"alice-pass"}`
@@ -81,20 +108,32 @@ func TestHTTPEndToEnd(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("login status=%d body=%v", status, out)
 	}
-	var access, csrfTok string
+	var access, csrfTok, refresh string
+	var refreshCookie *http.Cookie
 	for _, c := range cookies {
 		switch c.Name {
 		case "access_token":
 			access = c.Value
 		case "csrf_token":
 			csrfTok = c.Value
+		case "refresh_token":
+			refresh = c.Value
+			refreshCookie = c
 		}
 	}
-	if access == "" || csrfTok == "" {
+	if access == "" || csrfTok == "" || refresh == "" {
 		t.Fatal("missing cookies")
 	}
-	t.Logf("input=POST /login alice basis=credentials rule=200 + cookies; refresh in body redacted=%v",
-		out["refresh_token"])
+	if !refreshCookie.HttpOnly {
+		t.Fatal("refresh cookie must be HttpOnly")
+	}
+	if _, present := out["refresh_token"]; present {
+		t.Fatalf("refresh credential must not appear in response body: %v", out)
+	}
+	if _, present := out["access_token"]; present {
+		t.Fatal("access credential must not appear in response body")
+	}
+	t.Logf("input=POST /login alice basis=credentials rule=200; both creds HttpOnly cookies; body has no credential")
 
 	// Allowed: viewer GET /docs/r1.
 	req, _ = http.NewRequest(http.MethodGet, "/docs/r1?echo=<script>x</script>", nil)
@@ -186,7 +225,7 @@ func TestHTTPEndToEnd(t *testing.T) {
 }
 
 func TestHTTPLockoutStatusCodes(t *testing.T) {
-	h, _, _ := buildApp(t)
+	h := buildApp(t).h
 	post := func(pw string) int {
 		req, _ := http.NewRequest(http.MethodPost, "/login",
 			bytes.NewBufferString(`{"username":"alice","password":"`+pw+`"}`))

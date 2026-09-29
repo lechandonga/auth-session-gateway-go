@@ -40,7 +40,7 @@ func newHarness(t *testing.T, policy ratelimit.Policy) *harness {
 	sink := audit.NewMemorySink()
 	svc := NewService(Config{
 		Users:      users,
-		Sessions:   session.NewManager(session.NewMemoryStore(), time.Hour),
+		Sessions:   session.NewManager(session.NewMemoryStore(), session.Options{IdleTTL: time.Hour, AbsoluteTTL: 24 * time.Hour, MaxPerUser: 10}),
 		Signer:     token.NewHS256Signer(kr),
 		Limiter:    ratelimit.NewMemoryLimiter(policy),
 		Audit:      sink,
@@ -56,20 +56,20 @@ func TestLoginLockoutThenRecovery(t *testing.T) {
 		ThrottleAfter: 2, ThrottleDelay: time.Second, Window: 5 * time.Minute})
 	ctx := context.Background()
 	// 2 bad attempts -> throttle is distinguishable from lockout.
-	_, err := h.svc.Login(ctx, "alice", "wrong", "1.1.1.1")
+	_, err := h.svc.Login(ctx, "alice", "wrong", "1.1.1.1", "test-ua")
 	if !errors.Is(err, ErrBadCredentials) {
 		t.Fatalf("first bad login err = %v", err)
 	}
-	_, err = h.svc.Login(ctx, "alice", "wrong", "1.1.1.1")
+	_, err = h.svc.Login(ctx, "alice", "wrong", "1.1.1.1", "test-ua")
 	if !errors.Is(err, ErrThrottled) {
 		t.Fatalf("second bad login err = %v, want ErrThrottled", err)
 	}
 	// Third crosses threshold -> locked; even the CORRECT password is refused.
-	_, err = h.svc.Login(ctx, "alice", "wrong", "1.1.1.1")
+	_, err = h.svc.Login(ctx, "alice", "wrong", "1.1.1.1", "test-ua")
 	if !errors.Is(err, ErrLocked) {
 		t.Fatalf("third bad login err = %v, want ErrLocked", err)
 	}
-	if _, err := h.svc.Login(ctx, "alice", "correct horse", "1.1.1.1"); !errors.Is(err, ErrLocked) {
+	if _, err := h.svc.Login(ctx, "alice", "correct horse", "1.1.1.1", "test-ua"); !errors.Is(err, ErrLocked) {
 		t.Fatalf("correct password during lockout err = %v, want ErrLocked", err)
 	}
 	events, _ := h.sink.List(ctx)
@@ -88,7 +88,7 @@ func TestLoginLockoutThenRecovery(t *testing.T) {
 func TestFullLifecycleRotateRevokeAndKeyRotation(t *testing.T) {
 	h := newHarness(t, ratelimit.DefaultPolicy())
 	ctx := context.Background()
-	tok, err := h.svc.Login(ctx, "alice", "correct horse", "1.1.1.2")
+	tok, err := h.svc.Login(ctx, "alice", "correct horse", "1.1.1.2", "test-ua")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,11 +122,11 @@ func TestFullLifecycleRotateRevokeAndKeyRotation(t *testing.T) {
 	if _, err := h.svc.Refresh(ctx, tok.RefreshToken); !errors.Is(err, session.ErrRefreshReused) {
 		t.Fatalf("replay err = %v, want ErrRefreshReused", err)
 	}
-	if _, _, err := h.svc.Authenticate(ctx, rot.AccessToken); !errors.Is(err, ErrInvalidToken) {
-		t.Fatalf("access after family revoke err = %v, want ErrInvalidToken", err)
+	if _, _, err := h.svc.Authenticate(ctx, rot.AccessToken); !errors.Is(err, session.ErrSessionRevoked) {
+		t.Fatalf("access after family revoke err = %v, want session.ErrSessionRevoked", err)
 	}
-	if _, err := h.svc.Refresh(ctx, rot.RefreshToken); !errors.Is(err, ErrInvalidToken) {
-		t.Fatalf("rotated refresh after reuse err = %v, want ErrInvalidToken", err)
+	if _, err := h.svc.Refresh(ctx, rot.RefreshToken); !errors.Is(err, session.ErrSessionRevoked) {
+		t.Fatalf("rotated refresh after reuse err = %v, want session.ErrSessionRevoked", err)
 	}
 	var reuse, denies int
 	events, _ := h.sink.List(ctx)
@@ -150,14 +150,14 @@ func TestFullLifecycleRotateRevokeAndKeyRotation(t *testing.T) {
 func TestLogoutRevokes(t *testing.T) {
 	h := newHarness(t, ratelimit.DefaultPolicy())
 	ctx := context.Background()
-	tok, _ := h.svc.Login(ctx, "alice", "correct horse", "p")
+	tok, _ := h.svc.Login(ctx, "alice", "correct horse", "p", "test-ua")
 	if err := h.svc.Logout(ctx, tok.AccessToken); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := h.svc.Authenticate(ctx, tok.AccessToken); !errors.Is(err, ErrInvalidToken) {
+	if _, _, err := h.svc.Authenticate(ctx, tok.AccessToken); !errors.Is(err, session.ErrSessionRevoked) {
 		t.Fatalf("post-logout auth err = %v", err)
 	}
-	if _, err := h.svc.Refresh(ctx, tok.RefreshToken); !errors.Is(err, ErrInvalidToken) {
+	if _, err := h.svc.Refresh(ctx, tok.RefreshToken); !errors.Is(err, session.ErrSessionRevoked) {
 		t.Fatalf("post-logout refresh err = %v", err)
 	}
 	t.Log("input=logout basis=family revoke rule=session+all refresh tokens dead")
@@ -173,7 +173,7 @@ func TestConcurrentLoginsConsistentCounters(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, err := h.svc.Login(ctx, "alice", "bad", "peer")
+			_, err := h.svc.Login(ctx, "alice", "bad", "peer", "test-ua")
 			if errors.Is(err, ErrLocked) {
 				locked <- err
 			}
@@ -207,7 +207,7 @@ func TestConcurrentLoginsConsistentCounters(t *testing.T) {
 func TestExpiredAccessAndTamperedToken(t *testing.T) {
 	h := newHarness(t, ratelimit.DefaultPolicy())
 	ctx := context.Background()
-	tok, _ := h.svc.Login(ctx, "alice", "correct horse", "p")
+	tok, _ := h.svc.Login(ctx, "alice", "correct horse", "p", "test-ua")
 	if _, _, err := h.svc.Authenticate(ctx, tok.AccessToken+"x"); !errors.Is(err, ErrInvalidToken) {
 		t.Fatalf("tampered token err = %v", err)
 	}

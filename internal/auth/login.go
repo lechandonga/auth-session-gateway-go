@@ -7,6 +7,7 @@ import (
 	"github.com/lechandonga/auth-session-gateway-go/internal/audit"
 	"github.com/lechandonga/auth-session-gateway-go/internal/csrf"
 	"github.com/lechandonga/auth-session-gateway-go/internal/ratelimit"
+	"github.com/lechandonga/auth-session-gateway-go/internal/session"
 	"github.com/lechandonga/auth-session-gateway-go/internal/token"
 )
 
@@ -18,7 +19,7 @@ import (
 // limiter's single critical section, so concurrent attempts cannot skip the
 // threshold nor cross it twice. Each failure carries a unique event ID,
 // making retried requests idempotent rather than double-counted.
-func (s *Service) Login(ctx context.Context, username, password, peer string) (*LoginTokens, error) {
+func (s *Service) Login(ctx context.Context, username, password, peer, userAgent string) (*LoginTokens, error) {
 	now := s.cfg.Clock()
 	key := "login:" + username
 	eventID := newEventID("fail")
@@ -84,9 +85,19 @@ func (s *Service) Login(ctx context.Context, username, password, peer string) (*
 	// Success resets counters (idempotent).
 	_ = s.cfg.Limiter.RecordSuccess(ctx, key, "ok:"+eventID, now)
 
-	sess, rawRefresh, err := s.cfg.Sessions.Issue(ctx, u.ID, s.cfg.RefreshTTL, now)
+	sess, rawRefresh, evicted, err := s.cfg.Sessions.Issue(ctx, session.IssueParams{
+		UserID: u.ID, Peer: peer, UserAgent: userAgent,
+	}, now)
 	if err != nil {
 		return nil, err
+	}
+	for _, victim := range evicted {
+		s.emit(ctx, audit.Event{
+			EventID: "evict:" + victim.ID, Type: audit.EventSessionEvicted, OccurredAt: now,
+			Principal: victim.UserID, SessionID: victim.ID,
+			Details: map[string]string{"reason": string(session.RevokeEvicted),
+				"last_active_at": victim.LastActiveAt.Format(time.RFC3339Nano)},
+		})
 	}
 	expires := now.Add(s.cfg.AccessTTL)
 	access, kid, err := s.cfg.Signer.Issue(ctx, token.Claims{
@@ -104,13 +115,17 @@ func (s *Service) Login(ctx context.Context, username, password, peer string) (*
 	}
 	s.emit(ctx, audit.Event{
 		EventID: "loginok:" + sess.ID, Type: audit.EventLoginSuccess, OccurredAt: now,
-		Principal: u.ID, SessionID: sess.ID, Details: map[string]string{"kid": kid, "peer": peer},
+		Principal: u.ID, SessionID: sess.ID,
+		Details: map[string]string{"kid": kid, "peer": peer,
+			"user_agent": csrf.Sanitize(userAgent)},
 	})
 	return &LoginTokens{
-		AccessToken:  access,
-		RefreshToken: rawRefresh,
-		SessionID:    sess.ID,
-		KeyID:        kid,
-		ExpiresAt:    expires,
+		AccessToken:       access,
+		RefreshToken:      rawRefresh,
+		SessionID:         sess.ID,
+		KeyID:             kid,
+		ExpiresAt:         expires,
+		IdleExpiresAt:     sess.IdleExpiresAt,
+		AbsoluteExpiresAt: sess.AbsoluteExpiresAt,
 	}, nil
 }
